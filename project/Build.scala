@@ -14,7 +14,7 @@ object SlickBuild extends Build {
 
   val slickVersion = "3.2.3"
   val binaryCompatSlickVersion = "3.2.2" // Slick base version for binary compatibility checks
-  val scalaVersions = Seq("2.11.8", "2.12.4")
+  val scalaVersions = Seq("2.12.6")
 
   /** Dependencies for reuse in different parts of the build */
   object Dependencies {
@@ -64,8 +64,8 @@ object SlickBuild extends Build {
   )
 
   def localScalaSettings(path: String): Seq[Setting[_]] = Seq(
-    scalaVersion := "2.10.0-unknown",
-    scalaBinaryVersion := "2.10.0-unknown",
+    scalaVersion := "2.12.6",
+    scalaBinaryVersion := "2.12.6",
     crossVersion := CrossVersion.Disabled,
     scalaHome := Some(file(path)),
     autoScalaLibrary := false,

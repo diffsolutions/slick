@@ -17,9 +17,7 @@ import scala.util.control.NonFatal
 /** A Database I/O Action that can be executed on a database. The DBIOAction type allows a
   * separation of execution logic and resource usage management logic from composition logic.
   * DBIOActions can be composed with methods such as `andThen`, `andFinally` and `flatMap`.
-  * Individual parts of a composite DBIOAction are always executed serially on a single database,
-  * but possibly in different database sessions, unless the session is pinned either explicitly
-  * (using `withPinnedSession`) or implicitly (e.g. through a transaction).
+  * Individual parts of a composite DBIOAction are always executed serially on a single database.
   *
   * The actual implementation base type for all Actions is `DBIOAction`. `StreamingDBIO` and
   * `DBIO` are type aliases which discard the effect type (and the streaming result type in the
@@ -124,11 +122,6 @@ sealed trait DBIOAction[+R, +S <: NoStream, -E <: Effect] extends Dumpable {
     * can be used for error recovery. If possible, use [[andFinally]] or [[cleanUp]] instead,
     * because those combinators, unlike `asTry`, support streaming. */
   def asTry: DBIOAction[Try[R], NoStream, E] = AsTryAction[R, E](this)
-
-  /** Use a pinned database session when running this action. If it is composed of multiple
-    * database actions, they will all use the same session, even when sequenced with non-database
-    * actions. For non-composite or non-database actions, this has no effect. */
-  def withPinnedSession: DBIOAction[R, S, E] = DBIO.Pin andThen this andFinally DBIO.Unpin
 
   /** Get a wrapping action which has a name that will be included in log output. */
   def named(name: String): DBIOAction[R, S, E] =
@@ -258,18 +251,6 @@ object DBIOAction {
   def fold[T, E <: Effect](actions: Seq[DBIOAction[T, NoStream, E]], zero: T)(f: (T, T) => T)(implicit ec: ExecutionContext): DBIOAction[T, NoStream, E] =
     actions.foldLeft[DBIOAction[T, NoStream, E]](DBIO.successful(zero)) { (za, va) => za.flatMap(z => va.map(v => f(z, v))) }
 
-  /** A DBIOAction that pins the current session */
-  private[slick] object Pin extends SynchronousDatabaseAction[Unit, NoStream, BasicBackend, Effect] {
-    def run(context: BasicBackend#Context): Unit = context.pin
-    def getDumpInfo = DumpInfo(name = "SynchronousDatabaseAction.Pin")
-  }
-
-  /** A DBIOAction that unpins the current session */
-  private[slick] object Unpin extends SynchronousDatabaseAction[Unit, NoStream, BasicBackend, Effect] {
-    def run(context: BasicBackend#Context): Unit = context.unpin
-    def getDumpInfo = DumpInfo(name = "SynchronousDatabaseAction.Unpin")
-  }
-
   /** An ExecutionContext used internally for executing plumbing operations during DBIOAction
     * composition. */
   private[slick] object sameThreadExecutionContext extends ExecutionContext {
@@ -369,23 +350,7 @@ case class NamedAction[+R, +S <: NoStream, -E <: Effect](a: DBIOAction[R, S, E],
 
 /** The base trait for the context object passed to synchronous database actions by the execution
   * engine. */
-trait ActionContext {
-  private[this] var stickiness = 0
-
-  /** Check if the session is pinned. May only be called from a synchronous action context. */
-  final def isPinned = stickiness > 0
-
-  /** Pin the current session. Multiple calls to `pin` may be nested. The same number of calls
-    * to `unpin` is required in order to mark the session as not pinned anymore. A pinned
-    * session will not be released at the end of a primitive database action. Instead, the same
-    * pinned session is passed to all subsequent actions until it is unpinned. Note that pinning
-    * does not force an actual database connection to be opened. This still happens on demand.
-    * May only be called from a synchronous action context. */
-  final def pin: Unit = stickiness += 1
-
-  /** Unpin this session once. May only be called from a synchronous action context. */
-  final def unpin: Unit = stickiness -= 1
-}
+trait ActionContext
 
 /** An ActionContext with extra functionality required for streaming DBIOActions. */
 trait StreamingActionContext extends ActionContext {
@@ -402,7 +367,7 @@ trait StreamingActionContext extends ActionContext {
   * through `BasicBackend.DatabaseDef.runSynchronousDatabaseAction` so that `run` does not
   * need to be extended if all primitive database actions can be expressed in this way. These
   * actions also implement construction-time fusion for the `andFinally`, `andThen`, `asTry`,
-  * `failed`, `withPinnedSession` and `zip` operations.
+  * `failed` and `zip` operations.
   *
   * The execution engine ensures that an [[ActionContext]] is never used concurrently and that
   * all state changes performed by one invocation of a SynchronousDatabaseAction are visible
@@ -477,21 +442,6 @@ trait SynchronousDatabaseAction[+R, +S <: NoStream, -B <: BasicBackend, -E <: Ef
       override def nonFusedEquivalentAction: DBIOAction[R, S, E with E2] = superAndFinally(a)
     }
     case a => superAndFinally(a)
-  }
-
-  private[this] def superWithPinnedSession = super.withPinnedSession
-  override def withPinnedSession: DBIOAction[R, S, E] = new SynchronousDatabaseAction.Fused[R, S, B, E] {
-    def run(context: B#Context): R = {
-      context.pin
-      val res = try self.run(context) catch {
-        case NonFatal(ex) =>
-          context.unpin
-          throw ex
-      }
-      context.unpin
-      res
-    }
-    override def nonFusedEquivalentAction = superWithPinnedSession
   }
 
   private[this] def superFailed: DBIOAction[Throwable, NoStream, E] = super.failed

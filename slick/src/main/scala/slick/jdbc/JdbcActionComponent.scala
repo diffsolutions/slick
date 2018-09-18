@@ -1,23 +1,21 @@
 package slick.jdbc
 
-import slick.sql.{FixedSqlStreamingAction, FixedSqlAction, SqlActionComponent}
-
-import scala.language.{existentials, higherKinds}
-
-import java.sql.{PreparedStatement, Statement}
+import java.sql.{ PreparedStatement, Statement }
 
 import scala.collection.mutable.Builder
+import scala.language.{ existentials, higherKinds }
 import scala.util.control.NonFatal
 
 import slick.SlickException
 import slick.ast.ColumnOption.PrimaryKey
-import slick.dbio._
-import slick.ast._
-import slick.ast.Util._
 import slick.ast.TypeUtil.:@
-import slick.lifted.{CompiledStreamingExecutable, Query, FlatShapeLevel, Shape}
-import slick.relational.{ResultConverter, CompiledMapping}
-import slick.util.{DumpInfo, SQLBuilder, ignoreFollowOnError}
+import slick.ast.Util._
+import slick.ast._
+import slick.dbio._
+import slick.lifted.{ CompiledStreamingExecutable, FlatShapeLevel, Query, Shape }
+import slick.relational.{ CompiledMapping, ResultConverter }
+import slick.sql.{ FixedSqlAction, FixedSqlStreamingAction, SqlActionComponent }
+import slick.util.{ DumpInfo, SQLBuilder, ignoreFollowOnError }
 
 trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
 
@@ -35,21 +33,18 @@ trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
 
   protected object StartTransaction extends SynchronousDatabaseAction[Unit, NoStream, Backend, Effect] {
     def run(ctx: Backend#Context): Unit = {
-      ctx.pin
       ctx.session.startInTransaction
     }
     def getDumpInfo = DumpInfo(name = "StartTransaction")
   }
 
   protected object Commit extends SynchronousDatabaseAction[Unit, NoStream, Backend, Effect] {
-    def run(ctx: Backend#Context): Unit =
-      try ctx.session.endInTransaction(ctx.session.conn.commit()) finally ctx.unpin
+    def run(ctx: Backend#Context): Unit = ctx.session.endInTransaction(ctx.session.conn.commit())
     def getDumpInfo = DumpInfo(name = "Commit")
   }
 
   protected object Rollback extends SynchronousDatabaseAction[Unit, NoStream, Backend, Effect] {
-    def run(ctx: Backend#Context): Unit =
-      try ctx.session.endInTransaction(ctx.session.conn.rollback()) finally ctx.unpin
+    def run(ctx: Backend#Context): Unit = ctx.session.endInTransaction(ctx.session.conn.rollback())
     def getDumpInfo = DumpInfo(name = "Rollback")
   }
 
@@ -89,14 +84,14 @@ trait JdbcActionComponent extends SqlActionComponent { self: JdbcProfile =>
 
     /** Run this Action with the specified transaction isolation level. This should be used around
       * the outermost `transactionally` Action. The semantics of using it inside a transaction are
-      * database-dependent. It does not create a transaction by itself but it pins the session. */
+      * database-dependent. It does not create a transaction by itself. */
     def withTransactionIsolation(ti: TransactionIsolation): DBIOAction[R, S, E] = {
       val isolated =
         (new SetTransactionIsolation(ti.intValue)).flatMap(old => a.andFinally(new SetTransactionIsolation(old)))(DBIO.sameThreadExecutionContext)
       val fused =
         if(a.isInstanceOf[SynchronousDatabaseAction[_, _, _, _]]) SynchronousDatabaseAction.fuseUnsafe(isolated)
         else isolated
-      fused.withPinnedSession
+      fused
     }
 
     /** Run this Action with the given statement parameters. Any unset parameter will use the

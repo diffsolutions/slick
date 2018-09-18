@@ -3,17 +3,16 @@ package slick.jdbc
 import java.net.URI
 import java.sql.PreparedStatement
 
-import com.typesafe.config.ConfigException
-
 import scala.concurrent.Await
 import scala.concurrent.duration.Duration
 import scala.language.experimental.macros
-import scala.reflect.macros.{blackbox, whitebox}
+import scala.reflect.macros.{ blackbox, whitebox }
 
+import com.typesafe.config.ConfigException
 import slick.SlickException
-import slick.basic.{DatabaseConfig, StaticDatabaseConfigMacros}
-import slick.dbio.{NoStream, Effect}
-import slick.sql.{SqlAction, SqlStreamingAction}
+import slick.basic.{ DatabaseConfig, StaticDatabaseConfigMacros }
+import slick.dbio.{ Effect, NoStream }
+import slick.sql.{ SqlAction, SqlStreamingAction }
 import slick.util.ClassLoaderUtil
 
 class ActionBasedSQLInterpolation(val s: StringContext) extends AnyVal {

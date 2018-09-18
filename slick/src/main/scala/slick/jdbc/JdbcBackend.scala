@@ -1,24 +1,22 @@
 package slick.jdbc
 
 
-import org.reactivestreams.Subscriber
-
-import scala.concurrent.{ExecutionContext, Future}
-
+import java.sql.{ Array => _, _ }
 import java.util.Properties
-import java.sql.{Array => _, _}
-import javax.sql.DataSource
 import javax.naming.InitialContext
+import javax.sql.DataSource
 
-import slick.dbio._
-import slick.basic.DatabasePublisher
-import slick.SlickException
-import slick.relational.RelationalBackend
-import slick.util._
-import slick.util.ConfigExtensionMethods._
+import scala.concurrent.{ ExecutionContext, Future, Promise }
 
+import com.typesafe.config.{ Config, ConfigFactory }
+import org.reactivestreams.Subscriber
 import org.slf4j.LoggerFactory
-import com.typesafe.config.{ConfigFactory, Config}
+import slick.SlickException
+import slick.basic.DatabasePublisher
+import slick.dbio._
+import slick.relational.RelationalBackend
+import slick.util.ConfigExtensionMethods._
+import slick.util._
 
 /** A JDBC-based database back-end that is used by [[slick.jdbc.JdbcProfile]]. */
 trait JdbcBackend extends RelationalBackend {
@@ -34,7 +32,7 @@ trait JdbcBackend extends RelationalBackend {
 
   def createDatabase(config: Config, path: String): Database = Database.forConfig(path, config)
 
-  class DatabaseDef(val source: JdbcDataSource, val executor: AsyncExecutor) extends super.DatabaseDef {
+  class DatabaseDef(val source: JdbcDataSource, maxConns: Int, val executor: AsyncExecutor) extends super.DatabaseDef { self =>
     /** The DatabaseCapabilities, accessed through a Session and created by the
       * first Session that needs them. Access does not need to be synchronized
       * because, in the worst case, capabilities will be determined multiple
@@ -43,21 +41,80 @@ trait JdbcBackend extends RelationalBackend {
     @volatile
     protected[JdbcBackend] var capabilities: DatabaseCapabilities = null
 
-    def createSession(): Session = new BaseSession(this)
+    protected val ec: ExecutionContext = executor.executionContext
+
+    @volatile
+    private var openConns = 0
+
+    @volatile
+    private var pendingRequests = Vector.empty[Promise[Session]]
+
+    private def doCreateSession = {
+      try {
+        new BaseSession(self)
+      } catch {
+        case t: Throwable =>
+          self.sessionClosed()
+          throw t
+      }
+    }
+
+    def createSession(): Future[Session] = {
+      synchronized {
+        if (openConns < maxConns) {
+          openConns += 1
+          Future {
+            doCreateSession
+          }(ec)
+        } else {
+          val p = Promise[Session]()
+          pendingRequests = pendingRequests :+ p
+          p.future
+        }
+      }
+    }
+
+    def sessionClosed() {
+      val pOpt = synchronized {
+        if (pendingRequests.nonEmpty) {
+          val p = pendingRequests.head
+          pendingRequests = pendingRequests.tail
+
+          Some(p)
+        } else {
+          openConns -= 1
+
+          None
+        }
+      }
+
+      pOpt
+        .map { p =>
+          Future {
+            p.success(doCreateSession)
+          }(ec)
+        }
+    }
 
     /** Like `stream(StreamingAction)` but you can disable pre-buffering of the next row by setting
       * `bufferNext = false`. The ResultSet will not advance to the next row until you
       * `request()` more data. This allows you to process LOBs asynchronously by requesting only
       * one single element at a time after processing the current one, so that the proper
       * sequencing is preserved even though processing may happen on a different thread. */
-    final def stream[T](a: StreamingDBIO[_, T], bufferNext: Boolean): DatabasePublisher[T] =
-      createPublisher(a, s => new JdbcStreamingActionContext(s, false, DatabaseDef.this, bufferNext))
+    final def stream[T](a: StreamingDBIO[_, T], bufferNext: Boolean): Future[DatabasePublisher[T]] =
+      createSession()
+        .map { session =>
+          createPublisher(a, (s: Subscriber[_]) => new JdbcStreamingActionContext(s, false, DatabaseDef.this, bufferNext, session))
+        }(ec)
 
-    override protected[this] def createDatabaseActionContext[T](_useSameThread: Boolean): Context =
-      new JdbcActionContext { val useSameThread = _useSameThread }
+    override protected[this] def createDatabaseActionContext[T](_useSameThread: Boolean, _session: Session): Context =
+      new JdbcActionContext {
+        val useSameThread = _useSameThread
+        val currentSession = _session
+      }
 
-    override protected[this] def createStreamingDatabaseActionContext[T](s: Subscriber[_ >: T], useSameThread: Boolean): StreamingContext =
-      new JdbcStreamingActionContext(s, useSameThread, DatabaseDef.this, true)
+    override protected[this] def createStreamingDatabaseActionContext[T](s: Subscriber[_ >: T], useSameThread: Boolean, session: Session): StreamingContext =
+      new JdbcStreamingActionContext(s, useSameThread, DatabaseDef.this, true, session)
 
     protected[this] def synchronousExecutionContext = executor.executionContext
 
@@ -79,8 +136,8 @@ trait JdbcBackend extends RelationalBackend {
 
   trait DatabaseFactoryDef {
     /** Create a Database based on a [[JdbcDataSource]]. */
-    def forSource(source: JdbcDataSource, executor: AsyncExecutor = AsyncExecutor.default()) =
-      new DatabaseDef(source, executor)
+    def forSource(source: JdbcDataSource, maxConns: Int, executor: AsyncExecutor = AsyncExecutor.default()) =
+      new DatabaseDef(source, maxConns, executor)
 
     /** Create a Database based on a DataSource.
       *
@@ -92,8 +149,8 @@ trait JdbcBackend extends RelationalBackend {
       *                            is accessed for the first time, and kept open until `close()` is called. This is
       *                            useful for named in-memory databases in test environments.
       */
-    def forDataSource(ds: DataSource, maxConnections: Option[Int], executor: AsyncExecutor = AsyncExecutor.default(), keepAliveConnection: Boolean = false): DatabaseDef =
-      forSource(new DataSourceJdbcDataSource(ds, keepAliveConnection, maxConnections), executor)
+    def forDataSource(ds: DataSource, maxConnections: Int, executor: AsyncExecutor = AsyncExecutor.default(), keepAliveConnection: Boolean = false): DatabaseDef =
+      forSource(new DataSourceJdbcDataSource(ds, keepAliveConnection, Some(maxConnections)), maxConnections, executor)
 
     /** Create a Database based on the JNDI name of a DataSource.
       *
@@ -110,15 +167,14 @@ trait JdbcBackend extends RelationalBackend {
       *                      prevent deadlocks when scheduling database actions. Use `None` if there is no hard limit.
       * @param executor The AsyncExecutor for scheduling database actions.
       */
-    def forName(name: String, maxConnections: Option[Int], executor: AsyncExecutor = null): DatabaseDef =
+    def forName(name: String, maxConnections: Int, executor: AsyncExecutor = null): DatabaseDef =
       new InitialContext().lookup(name) match {
 
         case ds: DataSource =>
           val configuredExecutor =
-            (executor, maxConnections) match {
-              case (null, Some(maxConnec)) => AsyncExecutor.default(name, maxConnec)
-              case (null, None) => AsyncExecutor.default(name)
-              case (e, _) => e
+            executor match {
+              case null => AsyncExecutor.default(name, maxConnections)
+              case e    => e
             }
           forDataSource(ds, maxConnections, configuredExecutor)
 
@@ -126,24 +182,24 @@ trait JdbcBackend extends RelationalBackend {
       }
 
     /** Create a Database that uses the DriverManager to open new connections. */
-    def forURL(url: String, user: String = null, password: String = null, prop: Properties = null, driver: String = null,
+    def forURL(maxConnections: Int, url: String, user: String = null, password: String = null, prop: Properties = null, driver: String = null,
                executor: AsyncExecutor = AsyncExecutor.default(), keepAliveConnection: Boolean = false,
                classLoader: ClassLoader = ClassLoaderUtil.defaultClassLoader): DatabaseDef =
-      forDataSource(new DriverDataSource(url, user, password, prop, driver, classLoader = classLoader), None, executor, keepAliveConnection)
+      forDataSource(new DriverDataSource(url, user, password, prop, driver, classLoader = classLoader), maxConnections, executor, keepAliveConnection)
 
     /** Create a Database that uses the DriverManager to open new connections. */
-    def forURL(url: String, prop: Map[String, String]): Database = {
+    def forURL(maxConnections: Int, url: String, prop: Map[String, String]): Database = {
       val p = new Properties
       if(prop ne null)
         for((k,v) <- prop) if(k.ne(null) && v.ne(null)) p.setProperty(k, v)
-      forURL(url, prop = p, driver = null)
+      forURL(maxConnections, url, prop = p, driver = null)
     }
 
     /** Create a Database that directly uses a Driver to open new connections.
       * This is needed to open a JDBC URL with a driver that was not loaded by the system ClassLoader. */
-    def forDriver(driver: Driver, url: String, user: String = null, password: String = null, prop: Properties = null,
+    def forDriver(maxConnections: Int, driver: Driver, url: String, user: String = null, password: String = null, prop: Properties = null,
                   executor: AsyncExecutor = AsyncExecutor.default()): DatabaseDef =
-      forDataSource(new DriverDataSource(url, user, password, prop, driverObject = driver), None, executor)
+      forDataSource(new DriverDataSource(url, user, password, prop, driverObject = driver), maxConnections, executor)
 
     /** Load a database configuration through [[https://github.com/typesafehub/config Typesafe Config]].
       *
@@ -304,9 +360,8 @@ trait JdbcBackend extends RelationalBackend {
       val numThreads = usedConfig.getIntOr("numThreads", 20)
       val maxConnections = source.maxConnections.getOrElse(numThreads)
       val registerMbeans = usedConfig.getBooleanOr("registerMbeans", false)
-      val executor = AsyncExecutor(poolName, numThreads, numThreads, usedConfig.getIntOr("queueSize", 1000),
-        maxConnections, registerMbeans = registerMbeans)
-      forSource(source, executor)
+      val executor = AsyncExecutor(poolName, numThreads, registerMbeans = registerMbeans)
+      forSource(source, maxConnections, executor)
     }
   }
 
@@ -464,7 +519,10 @@ trait JdbcBackend extends RelationalBackend {
       }
     }
 
-    def close() { conn.close() }
+    def close() {
+      conn.close()
+      database.sessionClosed()
+    }
 
     private[slick] def startInTransaction: Unit = {
       if(!isInTransaction) conn.setAutoCommit(false)
@@ -515,8 +573,9 @@ trait JdbcBackend extends RelationalBackend {
        but it provides compatibility with the old Session-based API. This should be changed once
        the old API has been removed. */
     override def session: Session =
-      if(statementParameters eq null) super.session
-      else {
+      if(statementParameters eq null) {
+        super.session
+      } else {
         val p = statementParameters.head
         super.session.internalForParameters(p.rsType, p.rsConcurrency, p.rsHoldability, p.statementInit, p.fetchSize)
       }
@@ -525,7 +584,7 @@ trait JdbcBackend extends RelationalBackend {
     def connection: Connection = session.conn
   }
 
-  class JdbcStreamingActionContext(subscriber: Subscriber[_], useSameThread: Boolean, database: Database, val bufferNext: Boolean) extends BasicStreamingActionContext(subscriber, useSameThread, database) with JdbcActionContext
+  class JdbcStreamingActionContext(subscriber: Subscriber[_], useSameThread: Boolean, database: Database, val bufferNext: Boolean, session: Session) extends BasicStreamingActionContext(subscriber, useSameThread, database, session) with JdbcActionContext
 }
 
 object JdbcBackend extends JdbcBackend {

@@ -1,20 +1,16 @@
 package slick.basic
 
-import slick.util.AsyncExecutor.{Priority, Continuation, Fresh, WithConnection}
-
 
 import java.io.Closeable
-import java.util.concurrent.atomic.{AtomicReferenceArray, AtomicLong}
+import java.util.concurrent.atomic.{ AtomicLong, AtomicReferenceArray }
+
+import scala.concurrent.{ ExecutionContext, Future, Promise }
+import scala.util.control.NonFatal
+import scala.util.{ Failure, Success }
 
 import com.typesafe.config.Config
-
-import scala.concurrent.{Promise, ExecutionContext, Future}
-import scala.util.{Success, Failure}
-import scala.util.control.NonFatal
-
-import org.slf4j.LoggerFactory
 import org.reactivestreams._
-
+import org.slf4j.LoggerFactory
 import slick.SlickException
 import slick.dbio._
 import slick.util._
@@ -52,8 +48,25 @@ trait BasicBackend { self =>
 
   /** A database instance to which connections can be created. */
   trait DatabaseDef extends Closeable { this: Database =>
+    protected val ec: ExecutionContext
+
     /** Create a new session. The session needs to be closed explicitly by calling its close() method. */
-    def createSession(): Session
+    def createSession(): Future[Session]
+
+    final def withSession[A](f: Session => Future[A]): Future[A] = {
+      createSession()
+        .flatMap { session =>
+          f(session)
+            .recoverWith { case t: Throwable =>
+              session.close()
+              Future.failed(t)
+            }(ec)
+            .map { a =>
+              session.close()
+              a
+            }(ec)
+        }(ec)
+    }
 
     /** Free all resources allocated by Slick for this Database. This is done asynchronously, so
       * you need to wait for the returned `Future` to complete in order to ensure that everything
@@ -70,10 +83,10 @@ trait BasicBackend { self =>
     def close: Unit
 
     /** Run an Action asynchronously and return the result as a Future. */
-    final def run[R](a: DBIOAction[R, NoStream, Nothing]): Future[R] = runInternal(a, false)
+    final def run[R](a: DBIOAction[R, NoStream, Nothing]): Future[R] = withSession { runInternal(a, false, _) }
 
-    private[slick] final def runInternal[R](a: DBIOAction[R, NoStream, Nothing], useSameThread: Boolean): Future[R] =
-      try runInContext(a, createDatabaseActionContext(useSameThread), false, true)
+    private[slick] final def runInternal[R](a: DBIOAction[R, NoStream, Nothing], useSameThread: Boolean, session: Session): Future[R] =
+      try runInContext(a, createDatabaseActionContext(useSameThread, session), false, true)
       catch { case NonFatal(ex) => Future.failed(ex) }
 
     /** Create a `Publisher` for Reactive Streams which, when subscribed to, will run the specified
@@ -96,10 +109,12 @@ trait BasicBackend { self =>
       * from within `onNext`. If streaming is interrupted due to back-pressure signaling, the next
       * row will be prefetched (in order to buffer the next result page from the server when a page
       * boundary has been reached). */
-    final def stream[T](a: DBIOAction[_, Streaming[T], Nothing]): DatabasePublisher[T] = streamInternal(a, false)
+    final def stream[T](a: DBIOAction[_, Streaming[T], Nothing]): Future[DatabasePublisher[T]] =
+      createSession()
+        .map { streamInternal(a, false, _) }(ec)
 
-    private[slick] final def streamInternal[T](a: DBIOAction[_, Streaming[T], Nothing], useSameThread: Boolean): DatabasePublisher[T] =
-      createPublisher(a, s => createStreamingDatabaseActionContext(s, useSameThread))
+    private[slick] final def streamInternal[T](a: DBIOAction[_, Streaming[T], Nothing], useSameThread: Boolean, session: Session): DatabasePublisher[T] =
+      createPublisher(a, s => createStreamingDatabaseActionContext(s, useSameThread, session))
 
     /** Create a Reactive Streams `Publisher` using the given context factory. */
     protected[this] def createPublisher[T](a: DBIOAction[_, Streaming[T], Nothing], createCtx: Subscriber[_ >: T] => StreamingContext): DatabasePublisher[T] = new DatabasePublisher[T] {
@@ -115,8 +130,14 @@ trait BasicBackend { self =>
         if(subscribed) {
           try {
             runInContext(a, ctx, true, true).onComplete {
-              case Success(_) => ctx.tryOnComplete
-              case Failure(t) => ctx.tryOnError(t)
+              case Success(_) =>
+                ctx.tryOnComplete
+                ctx.session.close()
+
+              case Failure(t) =>
+                ctx.tryOnError(t)
+                ctx.session.close()
+
             }(DBIO.sameThreadExecutionContext)
           } catch { case NonFatal(ex) => ctx.tryOnError(ex) }
         }
@@ -124,10 +145,10 @@ trait BasicBackend { self =>
     }
 
     /** Create the default DatabaseActionContext for this backend. */
-    protected[this] def createDatabaseActionContext[T](_useSameThread: Boolean): Context
+    protected[this] def createDatabaseActionContext[T](_useSameThread: Boolean, _session: Session): Context
 
     /** Create the default StreamingDatabaseActionContext for this backend. */
-    protected[this] def createStreamingDatabaseActionContext[T](s: Subscriber[_ >: T], useSameThread: Boolean): StreamingContext
+    protected[this] def createStreamingDatabaseActionContext[T](s: Subscriber[_ >: T], useSameThread: Boolean, session: Session): StreamingContext
 
     /** Run an Action in an existing DatabaseActionContext. This method can be overridden in
       * subclasses to support new DatabaseActions which cannot be expressed through
@@ -237,49 +258,23 @@ trait BasicBackend { self =>
         case a: SynchronousDatabaseAction[_, _, _, _] =>
           if (streaming) {
             if (a.supportsStreaming) streamSynchronousDatabaseAction(a.asInstanceOf[SynchronousDatabaseAction[_, _ <: NoStream, This, _ <: Effect]], ctx.asInstanceOf[StreamingContext], !topLevel).asInstanceOf[Future[R]]
-            else runInContextSafe(CleanUpAction(AndThenAction(Vector(DBIO.Pin, a.nonFusedEquivalentAction)), _ => DBIO.Unpin, true, DBIO.sameThreadExecutionContext), ctx, streaming, topLevel, stackLevel)
+            else runInContextSafe(a.nonFusedEquivalentAction, ctx, streaming, topLevel, stackLevel)
           } else runSynchronousDatabaseAction(a.asInstanceOf[SynchronousDatabaseAction[R, NoStream, This, _]], ctx, !topLevel)
         case a: DatabaseAction[_, _, _] =>
           throw new SlickException(s"Unsupported database action $a for $this")
       }
     }
 
-    /** Within a synchronous execution, ensure that a Session is available. */
-    protected[this] final def acquireSession(ctx: Context): Unit =
-      if(!ctx.isPinned) ctx.currentSession = createSession()
-
-    /** Within a synchronous execution, close the current Session unless it is pinned.
-      *
-      * @param discardErrors If set to true, swallow all non-fatal errors that arise while
-      *        closing the Session. */
-    protected[this] final def releaseSession(ctx: Context, discardErrors: Boolean): Unit =
-      if(!ctx.isPinned) {
-        try ctx.currentSession.close() catch { case NonFatal(ex) if(discardErrors) => }
-        ctx.currentSession = null
-      }
-
     /** Run a `SynchronousDatabaseAction` on this database. */
     protected[this] def runSynchronousDatabaseAction[R](a: SynchronousDatabaseAction[R, NoStream, This, _], ctx: Context, continuation: Boolean): Future[R] = {
       val promise = Promise[R]()
-      ctx.getEC(synchronousExecutionContext).prepare.execute(new AsyncExecutor.PrioritizedRunnable {
-        def priority = {
-          ctx.readSync
-          ctx.priority(continuation)
-        }
-
+      ctx.getEC(synchronousExecutionContext).prepare.execute(new Runnable {
         def run: Unit =
           try {
             ctx.readSync
             val res = try {
-              acquireSession(ctx)
-              val res = try a.run(ctx) catch { case NonFatal(ex) =>
-                releaseSession(ctx, true)
-                throw ex
-              }
-              releaseSession(ctx, false)
-              res
+              a.run(ctx)
             } finally {
-              if (!ctx.isPinned && ctx.priority(continuation) != WithConnection) connectionReleased = true
               ctx.sync = 0
             }
             promise.success(res)
@@ -298,13 +293,8 @@ trait BasicBackend { self =>
     /** Stream a part of the results of a `SynchronousDatabaseAction` on this database. */
     protected[BasicBackend] def scheduleSynchronousStreaming(a: SynchronousDatabaseAction[_, _ <: NoStream, This, _ <: Effect], ctx: StreamingContext, continuation: Boolean)(initialState: a.StreamState): Unit =
       try {
-        ctx.getEC(synchronousExecutionContext).prepare.execute(new AsyncExecutor.PrioritizedRunnable {
+        ctx.getEC(synchronousExecutionContext).prepare.execute(new Runnable {
           private[this] def str(l: Long) = if(l != Long.MaxValue) l else if(GlobalConfig.unicodeDump) "\u221E" else "oo"
-
-          def priority = {
-            ctx.readSync
-            ctx.priority(continuation)
-          }
 
           def run(): Unit =
             try {
@@ -312,7 +302,6 @@ trait BasicBackend { self =>
               var state = initialState
               ctx.readSync
 
-              if(state eq null) acquireSession(ctx)
               var demand = ctx.demandBatch
               var realDemand = if(demand < 0) demand - Long.MinValue else demand
 
@@ -335,18 +324,15 @@ trait BasicBackend { self =>
                   }
 
                   if(state eq null) { // streaming finished and cleaned up
-                    releaseSession(ctx, true)
                     ctx.streamingResultPromise.trySuccess(null)
                   }
 
                 } catch { case NonFatal(ex) =>
                   if(state ne null) try a.cancelStream(ctx, state) catch ignoreFollowOnError
-                  releaseSession(ctx, true)
                   throw ex
 
                 } finally {
                   ctx.streamState = state
-                  if (!ctx.isPinned && ctx.priority(continuation) != WithConnection) connectionReleased = true
                   ctx.sync = 0
                 }
 
@@ -368,7 +354,6 @@ trait BasicBackend { self =>
             } catch {
               case NonFatal(ex) => ctx.streamingResultPromise.tryFailure(ex)
             } finally {
-              if (!ctx.isPinned && ctx.priority(continuation) != WithConnection) connectionReleased = true
               ctx.sync = 0
             }
         })
@@ -429,13 +414,7 @@ trait BasicBackend { self =>
 
     private[BasicBackend] def readSync = sync // workaround for SI-9053 to avoid warnings
 
-    private[BasicBackend] var currentSession: Session = null
-
-    private[BasicBackend] def priority(continuation: Boolean): Priority = {
-      if (currentSession != null) WithConnection
-      else if (continuation) Continuation
-      else Fresh
-    }
+    protected val currentSession: Session
 
     /** Used for the sequence counter in Action debug output. This variable is volatile because it
       * is only updated sequentially but not protected by a synchronous action context. */
@@ -445,7 +424,7 @@ trait BasicBackend { self =>
   }
 
   /** A special DatabaseActionContext for streaming execution. */
-  protected[this] class BasicStreamingActionContext(subscriber: Subscriber[_], protected[BasicBackend] val useSameThread: Boolean, database: Database) extends BasicActionContext with StreamingActionContext with Subscription {
+  protected[this] class BasicStreamingActionContext(subscriber: Subscriber[_], protected[BasicBackend] val useSameThread: Boolean, database: Database, override val currentSession: Session) extends BasicActionContext with StreamingActionContext with Subscription {
     /** Whether the Subscriber has been signaled with `onComplete` or `onError`. */
     private[this] var finished = false
 

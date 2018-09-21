@@ -125,6 +125,7 @@ trait BasicBackend { self =>
         val subscribed = try { s.onSubscribe(ctx.subscription); true } catch {
           case NonFatal(ex) =>
             streamLogger.warn("Subscriber.onSubscribe failed unexpectedly", ex)
+            ctx.session.close()
             false
         }
         if(subscribed) {

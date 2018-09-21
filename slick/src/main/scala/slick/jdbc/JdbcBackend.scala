@@ -7,6 +7,7 @@ import javax.naming.InitialContext
 import javax.sql.DataSource
 
 import scala.concurrent.{ ExecutionContext, Future, Promise }
+import scala.util.Try
 
 import com.typesafe.config.{ Config, ConfigFactory }
 import org.reactivestreams.Subscriber
@@ -91,7 +92,7 @@ trait JdbcBackend extends RelationalBackend {
       pOpt
         .map { p =>
           Future {
-            p.success(doCreateSession)
+            p.complete(Try(doCreateSession))
           }(ec)
         }
     }

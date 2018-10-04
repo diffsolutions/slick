@@ -258,9 +258,14 @@ trait BasicBackend { self =>
           runInContextSafe(a, ctx, streaming, topLevel, stackLevel)
         case a: SynchronousDatabaseAction[_, _, _, _] =>
           if (streaming) {
-            if (a.supportsStreaming) streamSynchronousDatabaseAction(a.asInstanceOf[SynchronousDatabaseAction[_, _ <: NoStream, This, _ <: Effect]], ctx.asInstanceOf[StreamingContext], !topLevel).asInstanceOf[Future[R]]
-            else runInContextSafe(a.nonFusedEquivalentAction, ctx, streaming, topLevel, stackLevel)
-          } else runSynchronousDatabaseAction(a.asInstanceOf[SynchronousDatabaseAction[R, NoStream, This, _]], ctx, !topLevel)
+            if (a.supportsStreaming) {
+              streamSynchronousDatabaseAction(a.asInstanceOf[SynchronousDatabaseAction[_, _ <: NoStream, This, _ <: Effect]], ctx.asInstanceOf[StreamingContext], !topLevel).asInstanceOf[Future[R]]
+            } else {
+              runInContextSafe(a.nonFusedEquivalentAction, ctx, streaming, topLevel, stackLevel)
+            }
+          } else {
+            runSynchronousDatabaseAction(a.asInstanceOf[SynchronousDatabaseAction[R, NoStream, This, _]], ctx, !topLevel)
+          }
         case a: DatabaseAction[_, _, _] =>
           throw new SlickException(s"Unsupported database action $a for $this")
       }

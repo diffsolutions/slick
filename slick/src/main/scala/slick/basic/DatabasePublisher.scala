@@ -11,6 +11,8 @@ import scala.util.{Failure, Success}
 abstract class DatabasePublisher[T] extends Publisher[T] { self =>
   /** Create a Publisher that runs a synchronous mapping function on this Publisher. This
     * can be used to materialize LOB values in a convenient way. */
+  /*
+   // not used
   def mapResult[U](f: T => U): DatabasePublisher[U] = new DatabasePublisher[U] {
     def subscribe(s: Subscriber[_ >: U]) = self.subscribe(new Subscriber[T] {
       def onSubscribe(sn: Subscription): Unit = s.onSubscribe(sn)
@@ -19,10 +21,13 @@ abstract class DatabasePublisher[T] extends Publisher[T] { self =>
       def onNext(t: T): Unit = s.onNext(f(t))
     })
   }
+   */
 
   /** Consume the stream, processing each element sequentially on the specified ExecutionContext.
     * The resulting Future completes when all elements have been processed or an error was
     * signaled. */
+  /*
+   // not used
   def foreach[U](f: T => U)(implicit ec: ExecutionContext): Future[Unit] = {
     val p = Promise[Unit]()
     @volatile var lastMsg: Future[Any] = null
@@ -57,4 +62,5 @@ abstract class DatabasePublisher[T] extends Publisher[T] { self =>
     })
     p.future
   }
+   */
 }
